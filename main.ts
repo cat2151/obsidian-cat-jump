@@ -5,26 +5,46 @@ import { Editor, MarkdownView, Plugin } from 'obsidian';
  */
 interface JumpTarget {
     line: number;
-    char: string;       // 実際の入力判定文字 (例: "a")
-    label: string;      // 表示用のラベル (例: "a", ";a")
-    isSecondPage: boolean; // セミコロン(;)が必要な2ページ目かどうか
+    char: string;       // 実際の判定文字 (例: "a")
+    label: string;      // 表示用ラベル (例: "a", "ja")
+    prefix: string | null; // プレフィックス ("j", "k"... or null)
     top: number;
     left: number;
-    element?: HTMLElement; // DOM要素への参照
+    element?: HTMLElement;
 }
 
+/**
+ * キー割り当て計算結果用インターフェース
+ */
+interface KeyScheme {
+    baseKeys: string[];      // 1ページ目のキー配列
+    activePrefixes: string[]; // 使用するプレフィックス配列
+}
+
+// Monokai Palette Definition
+const MONOKAI = {
+    yellow: '#E6DB74',
+    green:  '#A6E22E',
+    orange: '#FD971F',
+    purple: '#AE81FF',
+    blue:   '#66D9EF',
+    red:    '#F92672',
+    bg:     '#272822',
+    fg:     '#F8F8F2'
+};
+
 export default class JumpPlugin extends Plugin {
-    // コンテナ類の参照
     private overlayContainer: HTMLElement | null = null;
-    
-    // イベントハンドラの参照
     private keyHandler: ((e: KeyboardEvent) => void) | null = null;
 
-    // ジャンプに使用する基本キー配列 (a-z, A-Z)
-    private readonly jumpKeys = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    // 全アルファベット
+    private readonly fullAlphabet = "abcdefghijklmnopqrstuvwxyz";
     
-    // 状態管理
-    private isSemicolonPending: boolean = false; // ";" が押されたかどうかのフラグ
+    // プレフィックスとして使用する優先順位
+    private readonly prefixOrder = "jklmnopqrstuvwxyz"; 
+
+    // 状態管理: 現在入力待ちのプレフィックス
+    private pendingPrefix: string | null = null;
 
     async onload() {
         this.addCommand({
@@ -36,95 +56,124 @@ export default class JumpPlugin extends Plugin {
         });
     }
 
-    /**
-     * Jumpコマンドのメイン処理フロー
-     */
     private handleJump(editor: Editor, view: MarkdownView): void {
-        // 1. クリーンアップ & 初期化
         this.cleanup();
-        this.isSemicolonPending = false;
+        this.pendingPrefix = null;
 
-        // 2. ターゲット取得
         const targets = this.getVisibleJumpTargets(editor, view);
         
-        if (targets.length === 0) {
-            return;
-        }
+        if (targets.length === 0) return;
 
-        // 3. オーバーレイ表示（ここでサイズ調整を行う）
         this.createOverlays(targets);
-
-        // 4. 入力待機
         this.awaitInput(editor, targets);
     }
 
     /**
-     * 表示範囲内の行を特定し、ターゲット情報を生成する
+     * ターゲット生成ロジック (2パス処理)
      */
     private getVisibleJumpTargets(editor: Editor, view: MarkdownView): JumpTarget[] {
-        const targets: JumpTarget[] = [];
+        const potentialTargets: { line: number, top: number, left: number }[] = [];
         const lineCount = editor.lineCount();
         
-        // @ts-ignore: contentEl is accessible
+        // @ts-ignore
         const contentEl = view.contentEl;
         const viewRect = contentEl.getBoundingClientRect();
         
-        let keyIndex = 0;
         let lastTop = -9999;
-        
-        // 最大割当可能数: キー配列長 + (セミコロン + キー配列長)
-        const maxKeys = this.jumpKeys.length * 2;
 
+        // --- Step 1: 有効な座標を持つ行を収集 ---
         for (let i = 0; i < lineCount; i++) {
-            if (keyIndex >= maxKeys) break;
-
             const coords = this.getCoords(editor, i, 0);
             if (!coords) continue;
 
-            // 折りたたみ判定 & 画面外判定
-            // coords.bottom - coords.top <= 0 : 高さが0なら非表示
+            // 折りたたみ & 画面外判定
             if ((coords.bottom - coords.top <= 0) || (Math.abs(coords.top - lastTop) < 2)) continue;
-            
-            // 完全に画面外ならスキップ
             if (coords.bottom < viewRect.top || coords.top > viewRect.bottom) continue;
 
-            // キー割り当てロジック
-            let charCode = "";
-            let label = "";
-            let isSecondPage = false;
-
-            if (keyIndex < this.jumpKeys.length) {
-                // 1ページ目 (a-Z)
-                charCode = this.jumpKeys[keyIndex];
-                label = charCode;
-                isSecondPage = false;
-            } else {
-                // 2ページ目 (; + a-Z)
-                const adjustedIndex = keyIndex - this.jumpKeys.length;
-                charCode = this.jumpKeys[adjustedIndex];
-                label = `;${charCode}`;
-                isSecondPage = true;
-            }
-
-            targets.push({
+            potentialTargets.push({
                 line: i,
-                char: charCode,
-                label: label,
-                isSecondPage: isSecondPage,
                 top: coords.top,
                 left: coords.left
             });
-            
             lastTop = coords.top;
-            keyIndex++;
+        }
+
+        const targetCount = potentialTargets.length;
+        if (targetCount === 0) return [];
+
+        // --- Step 2: キー構成決定 ---
+        const scheme = this.calculateKeyScheme(targetCount);
+        const { baseKeys, activePrefixes } = scheme;
+        
+        // --- Step 3: ラベル割り当て ---
+        const targets: JumpTarget[] = [];
+        const baseLen = baseKeys.length;
+        const suffixLen = this.fullAlphabet.length; // 26
+
+        const maxCapacity = baseLen + (activePrefixes.length * suffixLen);
+        const countToProcess = Math.min(targetCount, maxCapacity);
+
+        for (let i = 0; i < countToProcess; i++) {
+            const pt = potentialTargets[i];
+            let charCode = "";
+            let label = "";
+            let prefix: string | null = null;
+
+            if (i < baseLen) {
+                // 1ページ目 (Base keys)
+                charCode = baseKeys[i];
+                label = charCode;
+                prefix = null;
+            } else {
+                // 2ページ目以降 (Prefix + Suffix)
+                const offset = i - baseLen;
+                const prefixIndex = Math.floor(offset / suffixLen);
+                const suffixIndex = offset % suffixLen;
+
+                if (prefixIndex < activePrefixes.length) {
+                    const p = activePrefixes[prefixIndex];
+                    const s = this.fullAlphabet[suffixIndex];
+                    
+                    charCode = s;
+                    label = `${p}${s}`;
+                    prefix = p;
+                }
+            }
+
+            targets.push({
+                line: pt.line,
+                char: charCode,
+                label: label,
+                prefix: prefix,
+                top: pt.top,
+                left: pt.left
+            });
         }
 
         return targets;
     }
 
     /**
-     * 座標取得ヘルパー
+     * ターゲット総数に応じてプレフィックス数とベースキー配列を計算
      */
+    private calculateKeyScheme(count: number): KeyScheme {
+        const full = this.fullAlphabet.split('');
+        const maxPrefixes = this.prefixOrder.length;
+
+        for (let p = 0; p <= maxPrefixes; p++) {
+            const baseCount = 26 - p;
+            const extendedCount = p * 26;
+            const capacity = baseCount + extendedCount;
+
+            if (capacity >= count || p === maxPrefixes) {
+                const activePrefixes = this.prefixOrder.slice(0, p).split('');
+                const baseKeys = full.filter(char => !activePrefixes.includes(char));
+                return { baseKeys, activePrefixes };
+            }
+        }
+        return { baseKeys: full, activePrefixes: [] };
+    }
+
     private getCoords(editor: Editor, line: number, ch: number): { left: number, top: number, bottom: number } | null {
         // @ts-ignore
         const cm = (editor as any).cm;
@@ -143,8 +192,26 @@ export default class JumpPlugin extends Plugin {
     }
 
     /**
-     * オーバーレイDOM作成
-     * ここで隣接するターゲットとの距離を計算し、フォントサイズを動的に変更する
+     * 文字からMonokaiカラーを取得する (グループ固定)
+     */
+    private getColorForChar(char: string): string {
+        const c = char.toLowerCase();
+        // a-e: Yellow
+        if (/[a-e]/.test(c)) return MONOKAI.yellow;
+        // f-j: Green
+        if (/[f-j]/.test(c)) return MONOKAI.green;
+        // k-o: Orange
+        if (/[k-o]/.test(c)) return MONOKAI.orange;
+        // p-t: Purple
+        if (/[p-t]/.test(c)) return MONOKAI.purple;
+        // u-z: Blue
+        if (/[u-z]/.test(c)) return MONOKAI.blue;
+        
+        return MONOKAI.red; // Fallback
+    }
+
+    /**
+     * オーバーレイ作成
      */
     private createOverlays(targets: JumpTarget[]): void {
         this.overlayContainer = document.createElement('div');
@@ -160,32 +227,34 @@ export default class JumpPlugin extends Plugin {
             zIndex: '9999'
         });
 
-        // 定数設定
-        const MAX_FONT_SIZE = 20; // 基本の最大フォントサイズ
-        const MIN_FONT_SIZE = 12; // 縮小する場合の最小限界
-        const PADDING_V = 4;      // 上下のpadding合計 (2px + 2px)
-        const BORDER_V = 2;       // 上下のborder合計 (1px + 1px)
-        const MARGIN = 2;         // ラベル間の最低マージン
+        // フォントサイズ設定
+        const MAX_FONT_SIZE = 26; // 最大サイズを大きく設定
+        const MIN_FONT_SIZE = 14;
 
         for (let i = 0; i < targets.length; i++) {
             const target = targets[i];
-            const nextTarget = targets[i + 1]; // 次の行のターゲット（存在すれば）
+            const nextTarget = targets[i + 1];
 
-            // デフォルトサイズ
+            // --- フォントサイズ計算（行間調整） ---
             let fontSize = MAX_FONT_SIZE;
-
-            // 次の行が存在する場合、隙間を計算してリサイズ判定を行う
+            
             if (nextTarget) {
                 const availableHeight = nextTarget.top - target.top;
+                // 枠線なし、padding極小のため、availableHeightのほぼ全てを使える
+                // 少しだけマージン(1px程度)を持たせる
+                const allowedFontSize = availableHeight - 1; 
                 
-                // ラベルに必要な高さ = fontSize + padding + border
-                // したがって、許容できるfontSize = 利用可能な高さ - padding - border - マージン
-                const allowedFontSize = availableHeight - PADDING_V - BORDER_V - MARGIN;
-
                 if (allowedFontSize < MAX_FONT_SIZE) {
                     fontSize = Math.max(MIN_FONT_SIZE, allowedFontSize);
                 }
             }
+
+            // --- 配色決定 ---
+            // サフィックス文字（target.char）に基づいて色を決定
+            const bgColor = this.getColorForChar(target.char);
+            
+            // 背景が明るいMonokaiカラーなので、文字色は背景色に近い濃い色にする
+            const textColor = '#272822'; 
 
             const el = document.createElement('div');
             el.textContent = target.label;
@@ -194,20 +263,24 @@ export default class JumpPlugin extends Plugin {
                 position: 'absolute',
                 top: `${target.top}px`,
                 left: `${target.left}px`,
-                backgroundColor: '#FFD700', // Gold
-                color: '#000000',
-                border: '1px solid #000000',
-                fontSize: `${fontSize}px`, // 動的に計算したサイズを適用
+                backgroundColor: bgColor,
+                color: textColor,
+                // border削除
+                border: 'none', 
+                fontSize: `${fontSize}px`,
                 fontFamily: 'monospace',
-                fontWeight: '900',
-                padding: '2px 6px',
-                borderRadius: '4px',
-                boxShadow: '0 4px 8px rgba(0,0,0,0.5)',
+                fontWeight: '900', // Bold
+                // padding縮小
+                padding: '0 2px', 
+                borderRadius: '2px',
+                // 境界線代わりの影（控えめに）
+                boxShadow: '0 1px 3px rgba(0,0,0,0.5)', 
                 lineHeight: '1',
-                transform: 'translateY(-2px)', // 少し上にずらして行のベースラインに合わせる
+                // ベースライン調整: 文字が大きいので少し上にずらす
+                transform: 'translateY(-3px)', 
                 zIndex: '10000',
-                transition: 'opacity 0.2s',
-                whiteSpace: 'nowrap' // 折り返し防止
+                transition: 'opacity 0.1s, transform 0.1s',
+                whiteSpace: 'nowrap'
             });
 
             target.element = el;
@@ -218,69 +291,87 @@ export default class JumpPlugin extends Plugin {
     }
 
     /**
-     * セミコロンモードに入った時の表示更新（無関係なラベルを隠す）
+     * プレフィックス入力時の表示フィルタリング
      */
-    private filterOverlaysForSemicolon(): void {
+    private updateOverlayVisibility(): void {
         const children = this.overlayContainer?.children;
         if (!children) return;
 
         for (let i = 0; i < children.length; i++) {
             const el = children[i] as HTMLElement;
-            // ラベルが ";" で始まらないものは薄くする
-            if (!el.textContent?.startsWith(';')) {
-                el.style.opacity = '0.1';
+            const text = el.textContent || "";
+            
+            let shouldShow = false;
+
+            if (this.pendingPrefix === null) {
+                // 何も押されていない時は全て表示
+                shouldShow = true;
             } else {
-                // ";" で始まるものは強調
-                el.style.backgroundColor = '#FFA500';
-                el.style.borderColor = 'white';
+                // プレフィックス入力済み
+                if (text.startsWith(this.pendingPrefix)) {
+                    shouldShow = true;
+                } else {
+                    shouldShow = false;
+                }
+            }
+
+            if (shouldShow) {
+                el.style.opacity = '1';
+                if (this.pendingPrefix) {
+                    // 選択中は少し強調
+                    el.style.transform = 'translateY(-3px) scale(1.05)';
+                    el.style.zIndex = '10001';
+                    // 選択中は白枠をつけて強調しても良いかもしれないが、
+                    // 要望通り枠線なしを基本とする
+                } else {
+                    el.style.transform = 'translateY(-3px)';
+                    el.style.zIndex = '10000';
+                }
+            } else {
+                el.style.opacity = '0.05'; // ほぼ透明に
+                el.style.transform = 'translateY(-3px)';
+                el.style.zIndex = '9999';
             }
         }
     }
 
-    /**
-     * 入力待機
-     */
     private awaitInput(editor: Editor, targets: JumpTarget[]): void {
         this.keyHandler = (e: KeyboardEvent) => {
-            // 修飾キー単体は無視
             if (["Shift", "Control", "Alt", "Meta"].includes(e.key)) return;
-
-            // IME入力中 (Processキーなど) は何もせず無視する
-            if (e.isComposing || e.key === 'Process' || e.keyCode === 229) {
-                return;
-            }
+            if (e.isComposing || e.key === 'Process' || e.keyCode === 229) return;
 
             e.preventDefault();
             e.stopPropagation();
 
             const inputChar = e.key;
 
-            // --- A. セミコロン入力時の処理 ---
-            if (inputChar === ';') {
-                if (this.isSemicolonPending) {
-                    this.cleanup(); // 2回押したらキャンセル扱い
-                } else {
-                    this.isSemicolonPending = true;
-                    this.filterOverlaysForSemicolon();
-                }
+            // --- プレフィックス判定 ---
+            const isPrefixChar = targets.some(t => t.prefix === inputChar);
+
+            if (isPrefixChar && this.pendingPrefix === null) {
+                this.pendingPrefix = inputChar;
+                this.updateOverlayVisibility();
                 return;
             }
 
-            // --- B. 文字入力によるジャンプ判定 ---
+            // --- キャンセル判定 ---
+            if (this.pendingPrefix !== null && inputChar === this.pendingPrefix) {
+                this.pendingPrefix = null;
+                this.updateOverlayVisibility();
+                return;
+            }
+
+            // --- ジャンプ判定 ---
             const target = targets.find(t => {
-                if (this.isSemicolonPending) {
-                    // セミコロン待機中: 2ページ目かつ文字一致
-                    return t.isSecondPage && t.char === inputChar;
-                } else {
-                    // 通常時: 1ページ目かつ文字一致
-                    return !t.isSecondPage && t.char === inputChar;
+                if (this.pendingPrefix !== null) {
+                    return t.prefix === this.pendingPrefix && t.char === inputChar;
                 }
+                return t.prefix === null && t.char === inputChar;
             });
 
             if (target) {
                 this.executeJump(editor, target);
             } else {
-                // 不正なキーなら終了
                 this.cleanup();
             }
         };
@@ -298,13 +389,11 @@ export default class JumpPlugin extends Plugin {
             this.overlayContainer.remove();
             this.overlayContainer = null;
         }
-
         if (this.keyHandler) {
             window.removeEventListener('keydown', this.keyHandler, { capture: true });
             this.keyHandler = null;
         }
-        
-        this.isSemicolonPending = false;
+        this.pendingPrefix = null;
     }
 
     onunload() {
