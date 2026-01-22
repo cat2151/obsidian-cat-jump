@@ -1,9 +1,9 @@
 # obsidian-cat-jump
 
-## 特徴
-- easy。ラベルはa-zの順番で並んでおり場所を予測しやすいため、低い学習コストですぐ使えます。
-- 折りたたみ考慮。折りたたまれていない場所のみラベリングするため、直感的に操作できます。
-- 長文。デイリーノートや長文ノートなど、header構造のない場所を行き来する用途に向きます。
-- no modifier。押すコストのかかるSHIFTやCTRLを回避し、a-zキーの組み合わせのみで操作できるようにして、指への負担を下げています。
+## Features
+- Easy. Labels are arranged in a-z order, making it easy to predict locations and allowing for immediate use with a low learning curve.
+- Folding-aware. It only labels unfolded sections, allowing for intuitive operation.
+- Long documents. It is suitable for navigating between locations without a header structure, such as daily notes or other long documents.
+- No modifiers. It avoids the high-effort SHIFT and CTRL keys, allowing operation solely with a-z key combinations, thus reducing strain on your fingers.
 
-※recursive-foldingから転記する予定
+Note: To be transferred from recursive-folding.
