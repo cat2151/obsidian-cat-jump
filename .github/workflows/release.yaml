@@ -4,9 +4,9 @@ on:
   push:
     tags:
       - "*"
-  workflow_dispatch:
-    tags:
-      - "*"
+#  workflow_dispatch:
+#    tags:
+#      - "*"
 
 env:
   PLUGIN_NAME: cat-jump # Change this to match the id of your plugin.
