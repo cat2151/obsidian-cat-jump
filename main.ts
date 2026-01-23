@@ -53,13 +53,13 @@ class CoordinateService {
         const lineCount = editor.lineCount();
         // @ts-ignore
         const viewRect = view.contentEl.getBoundingClientRect();
-        
+
         const targets: RawTarget[] = [];
         let lastTop = -9999;
 
         for (let i = 0; i < lineCount; i++) {
             const coords = this.getLineCoords(editor, i);
-            
+
             if (this.isValidTarget(coords, viewRect, lastTop)) {
                 targets.push({ line: i, top: coords!.top, left: coords!.left });
                 lastTop = coords!.top;
@@ -94,7 +94,7 @@ class CoordinateService {
         if (Math.abs(coords.top - lastTop) < 2) return false;
         // 画面外判定
         if (coords.bottom < viewRect.top || coords.top > viewRect.bottom) return false;
-        
+
         return true;
     }
 }
@@ -133,7 +133,7 @@ class KeyAssignmentService {
         const { baseKeys, activePrefixes } = scheme;
         const baseLen = baseKeys.length;
         const suffixLen = this.fullAlphabet.length;
-        
+
         // 生成可能な最大数で打ち切る
         const maxCount = baseLen + (activePrefixes.length * suffixLen);
         const processCount = Math.min(rawTargets.length, maxCount);
@@ -142,7 +142,7 @@ class KeyAssignmentService {
 
         for (let i = 0; i < processCount; i++) {
             const raw = rawTargets[i];
-            
+
             if (i < baseLen) {
                 result.push(this.createBaseTarget(raw, baseKeys[i]));
             } else {
@@ -165,7 +165,7 @@ class KeyAssignmentService {
     private createExtendedTarget(raw: RawTarget, offset: number, prefixes: string[], suffixLen: number): JumpTarget {
         const prefixIndex = Math.floor(offset / suffixLen);
         const suffixIndex = offset % suffixLen;
-        
+
         // 安全策（通常ここには来ない）
         if (prefixIndex >= prefixes.length) return this.createBaseTarget(raw, "?");
 
@@ -190,7 +190,7 @@ class OverlayService {
     render(targets: JumpTarget[]): void {
         this.remove();
         this.container = this.createContainer();
-        
+
         targets.forEach((target, i) => {
             const nextTop = targets[i + 1]?.top;
             const marker = this.createMarkerElement(target, nextTop);
@@ -204,7 +204,7 @@ class OverlayService {
     updateVisibility(pendingPrefix: string | null): void {
         if (!this.container) return;
         const children = Array.from(this.container.children) as HTMLElement[];
-        
+
         children.forEach(el => {
             const text = el.textContent || "";
             const isMatch = this.shouldShow(text, pendingPrefix);
@@ -237,14 +237,14 @@ class OverlayService {
     private createMarkerElement(target: JumpTarget, nextTargetTop?: number): HTMLElement {
         const fontSize = this.calculateFontSize(target.top, nextTargetTop);
         const bgColor = this.getColorForChar(target.char);
-        
+
         const el = document.createElement('div');
         el.textContent = target.label;
-        
+
         // スタイルオブジェクトを取得して適用
         const styles = this.getMarkerStyles(target, fontSize, bgColor);
         Object.assign(el.style, styles);
-        
+
         return el;
     }
 
@@ -344,25 +344,23 @@ class InputHandler {
 
         const inputChar = e.key;
 
-        // 判定ロジックを順次実行
         if (this.tryJump(targets, inputChar)) return;
         if (this.trySetPrefix(targets, inputChar)) return;
-        
-        // どちらにも該当しなければキャンセル
+
         this.onCancel();
     }
 
     private shouldIgnoreKey(e: KeyboardEvent): boolean {
         return (
-            ["Shift", "Control", "Alt", "Meta"].includes(e.key) ||
-            e.isComposing || 
-            e.key === 'Process' || 
+            ["Shift", "Control", "Alt", "Meta", "NonConvert"].includes(e.key) ||
+            e.isComposing ||
+            e.key === 'Process' ||
             e.keyCode === 229
         );
     }
 
     /**
-     * ジャンプ成立判定 (バグ修正: プレフィックスと同一キーの場合もここで確定させる)
+     * ジャンプ成立判定
      */
     private tryJump(targets: JumpTarget[], input: string): boolean {
         const target = targets.find(t => {
