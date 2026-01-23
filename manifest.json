@@ -1,7 +1,7 @@
 {
 	"id": "cat-jump",
 	"name": "Cat Jump",
-	"version": "1.0.0",
+	"version": "0.0.1",
 	"minAppVersion": "0.15.0",
 	"description": "Quickly jump to lines using a-z labels.",
 	"author": "cat2151",
