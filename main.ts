@@ -1,27 +1,30 @@
 import { Editor, MarkdownView, Plugin } from 'obsidian';
 
-/**
- * ジャンプ先の情報を保持するインターフェース
- */
+// --- Interfaces ---
+
 interface JumpTarget {
     line: number;
-    char: string;       // 実際の判定文字 (例: "a")
-    label: string;      // 表示用ラベル (例: "a", "ja")
-    prefix: string | null; // プレフィックス ("j", "k"... or null)
+    char: string;
+    label: string;
+    prefix: string | null;
     top: number;
     left: number;
     element?: HTMLElement;
 }
 
-/**
- * キー割り当て計算結果用インターフェース
- */
-interface KeyScheme {
-    baseKeys: string[];      // 1ページ目のキー配列
-    activePrefixes: string[]; // 使用するプレフィックス配列
+interface RawTarget {
+    line: number;
+    top: number;
+    left: number;
 }
 
-// Monokai Palette Definition
+interface KeyScheme {
+    baseKeys: string[];
+    activePrefixes: string[];
+}
+
+// --- Constants ---
+
 const MONOKAI = {
     yellow: '#E6DB74',
     green:  '#A6E22E',
@@ -33,350 +36,405 @@ const MONOKAI = {
     fg:     '#F8F8F2'
 };
 
-export default class JumpPlugin extends Plugin {
-    private overlayContainer: HTMLElement | null = null;
-    private keyHandler: ((e: KeyboardEvent) => void) | null = null;
+const UI_CONSTANTS = {
+    MAX_FONT_SIZE: 26,
+    MIN_FONT_SIZE: 14,
+    Z_INDEX_BASE: 10000,
+    Z_INDEX_ACTIVE: 10001
+};
 
-    // 全アルファベット
-    private readonly fullAlphabet = "abcdefghijklmnopqrstuvwxyz";
-    
-    // プレフィックスとして使用する優先順位
-    private readonly prefixOrder = "jklmnopqrstuvwxyz"; 
+// --- Services ---
 
-    // 状態管理: 現在入力待ちのプレフィックス
-    private pendingPrefix: string | null = null;
-
-    async onload() {
-        this.addCommand({
-            id: 'jump',
-            name: 'Jump',
-            editorCallback: (editor: Editor, view: MarkdownView) => {
-                this.handleJump(editor, view);
-            }
-        });
-    }
-
-    private handleJump(editor: Editor, view: MarkdownView): void {
-        this.cleanup();
-        this.pendingPrefix = null;
-
-        const targets = this.getVisibleJumpTargets(editor, view);
-        
-        if (targets.length === 0) return;
-
-        this.createOverlays(targets);
-        this.awaitInput(editor, targets);
-    }
-
-    /**
-     * ターゲット生成ロジック (2パス処理)
-     */
-    private getVisibleJumpTargets(editor: Editor, view: MarkdownView): JumpTarget[] {
-        const potentialTargets: { line: number, top: number, left: number }[] = [];
+/**
+ * 座標計算とターゲット候補の抽出を担当
+ */
+class CoordinateService {
+    static getVisibleTargets(editor: Editor, view: MarkdownView): RawTarget[] {
         const lineCount = editor.lineCount();
-        
         // @ts-ignore
-        const contentEl = view.contentEl;
-        const viewRect = contentEl.getBoundingClientRect();
+        const viewRect = view.contentEl.getBoundingClientRect();
         
+        const targets: RawTarget[] = [];
         let lastTop = -9999;
 
-        // --- Step 1: 有効な座標を持つ行を収集 ---
         for (let i = 0; i < lineCount; i++) {
-            const coords = this.getCoords(editor, i, 0);
-            if (!coords) continue;
-
-            // 折りたたみ & 画面外判定
-            if ((coords.bottom - coords.top <= 0) || (Math.abs(coords.top - lastTop) < 2)) continue;
-            if (coords.bottom < viewRect.top || coords.top > viewRect.bottom) continue;
-
-            potentialTargets.push({
-                line: i,
-                top: coords.top,
-                left: coords.left
-            });
-            lastTop = coords.top;
-        }
-
-        const targetCount = potentialTargets.length;
-        if (targetCount === 0) return [];
-
-        // --- Step 2: キー構成決定 ---
-        const scheme = this.calculateKeyScheme(targetCount);
-        const { baseKeys, activePrefixes } = scheme;
-        
-        // --- Step 3: ラベル割り当て ---
-        const targets: JumpTarget[] = [];
-        const baseLen = baseKeys.length;
-        const suffixLen = this.fullAlphabet.length; // 26
-
-        const maxCapacity = baseLen + (activePrefixes.length * suffixLen);
-        const countToProcess = Math.min(targetCount, maxCapacity);
-
-        for (let i = 0; i < countToProcess; i++) {
-            const pt = potentialTargets[i];
-            let charCode = "";
-            let label = "";
-            let prefix: string | null = null;
-
-            if (i < baseLen) {
-                // 1ページ目 (Base keys)
-                charCode = baseKeys[i];
-                label = charCode;
-                prefix = null;
-            } else {
-                // 2ページ目以降 (Prefix + Suffix)
-                const offset = i - baseLen;
-                const prefixIndex = Math.floor(offset / suffixLen);
-                const suffixIndex = offset % suffixLen;
-
-                if (prefixIndex < activePrefixes.length) {
-                    const p = activePrefixes[prefixIndex];
-                    const s = this.fullAlphabet[suffixIndex];
-                    
-                    charCode = s;
-                    label = `${p}${s}`;
-                    prefix = p;
-                }
+            const coords = this.getLineCoords(editor, i);
+            
+            if (this.isValidTarget(coords, viewRect, lastTop)) {
+                targets.push({ line: i, top: coords!.top, left: coords!.left });
+                lastTop = coords!.top;
             }
-
-            targets.push({
-                line: pt.line,
-                char: charCode,
-                label: label,
-                prefix: prefix,
-                top: pt.top,
-                left: pt.left
-            });
         }
-
         return targets;
     }
 
-    /**
-     * ターゲット総数に応じてプレフィックス数とベースキー配列を計算
-     */
-    private calculateKeyScheme(count: number): KeyScheme {
+    private static getLineCoords(editor: Editor, line: number): { left: number, top: number, bottom: number } | null {
+        // @ts-ignore
+        const cm = (editor as any).cm;
+        if (!cm) return null;
+
+        return typeof cm.coordsAtPos === 'function'
+            ? this.getCoordsCM6(editor, cm, line)
+            : this.getCoordsCM5(cm, line);
+    }
+
+    private static getCoordsCM6(editor: Editor, cm: any, line: number) {
+        const offset = editor.posToOffset({ line, ch: 0 });
+        return cm.coordsAtPos(offset);
+    }
+
+    private static getCoordsCM5(cm: any, line: number) {
+        return cm.charCoords({ line, ch: 0 }, "window");
+    }
+
+    private static isValidTarget(coords: any, viewRect: DOMRect, lastTop: number): boolean {
+        if (!coords) return false;
+        // 折り畳み判定 & 行間判定
+        if (coords.bottom - coords.top <= 0) return false;
+        if (Math.abs(coords.top - lastTop) < 2) return false;
+        // 画面外判定
+        if (coords.bottom < viewRect.top || coords.top > viewRect.bottom) return false;
+        
+        return true;
+    }
+}
+
+/**
+ * キー配列の計算と文字の割り当てを担当
+ */
+class KeyAssignmentService {
+    private readonly fullAlphabet = "abcdefghijklmnopqrstuvwxyz";
+    private readonly prefixOrder = "jklmnopqrstuvwxyz";
+
+    assignKeys(rawTargets: RawTarget[]): JumpTarget[] {
+        const count = rawTargets.length;
+        if (count === 0) return [];
+
+        const scheme = this.calculateScheme(count);
+        return this.generateJumpTargets(rawTargets, scheme);
+    }
+
+    private calculateScheme(count: number): KeyScheme {
         const full = this.fullAlphabet.split('');
         const maxPrefixes = this.prefixOrder.length;
 
         for (let p = 0; p <= maxPrefixes; p++) {
-            const baseCount = 26 - p;
-            const extendedCount = p * 26;
-            const capacity = baseCount + extendedCount;
-
+            const capacity = (26 - p) + (p * 26);
             if (capacity >= count || p === maxPrefixes) {
                 const activePrefixes = this.prefixOrder.slice(0, p).split('');
-                const baseKeys = full.filter(char => !activePrefixes.includes(char));
+                const baseKeys = full.filter(c => !activePrefixes.includes(c));
                 return { baseKeys, activePrefixes };
             }
         }
         return { baseKeys: full, activePrefixes: [] };
     }
 
-    private getCoords(editor: Editor, line: number, ch: number): { left: number, top: number, bottom: number } | null {
-        // @ts-ignore
-        const cm = (editor as any).cm;
-        if (!cm) return null;
+    private generateJumpTargets(rawTargets: RawTarget[], scheme: KeyScheme): JumpTarget[] {
+        const { baseKeys, activePrefixes } = scheme;
+        const baseLen = baseKeys.length;
+        const suffixLen = this.fullAlphabet.length;
+        
+        // 生成可能な最大数で打ち切る
+        const maxCount = baseLen + (activePrefixes.length * suffixLen);
+        const processCount = Math.min(rawTargets.length, maxCount);
 
-        if (typeof cm.coordsAtPos === 'function') { // CM6
-            const offset = editor.posToOffset({ line, ch });
-            const rect = cm.coordsAtPos(offset);
-            return rect ? { left: rect.left, top: rect.top, bottom: rect.bottom } : null;
-        } 
-        if (typeof cm.charCoords === 'function') { // CM5
-            const rect = cm.charCoords({ line, ch }, "window");
-            return rect ? { left: rect.left, top: rect.top, bottom: rect.bottom } : null;
+        const result: JumpTarget[] = [];
+
+        for (let i = 0; i < processCount; i++) {
+            const raw = rawTargets[i];
+            
+            if (i < baseLen) {
+                result.push(this.createBaseTarget(raw, baseKeys[i]));
+            } else {
+                const offset = i - baseLen;
+                result.push(this.createExtendedTarget(raw, offset, activePrefixes, suffixLen));
+            }
         }
-        return null;
+        return result;
     }
 
-    /**
-     * 文字からMonokaiカラーを取得する (グループ固定)
-     */
-    private getColorForChar(char: string): string {
-        const c = char.toLowerCase();
-        // a-e: Yellow
-        if (/[a-e]/.test(c)) return MONOKAI.yellow;
-        // f-j: Green
-        if (/[f-j]/.test(c)) return MONOKAI.green;
-        // k-o: Orange
-        if (/[k-o]/.test(c)) return MONOKAI.orange;
-        // p-t: Purple
-        if (/[p-t]/.test(c)) return MONOKAI.purple;
-        // u-z: Blue
-        if (/[u-z]/.test(c)) return MONOKAI.blue;
-        
-        return MONOKAI.red; // Fallback
+    private createBaseTarget(raw: RawTarget, key: string): JumpTarget {
+        return {
+            ...raw,
+            char: key,
+            label: key,
+            prefix: null
+        };
     }
 
-    /**
-     * オーバーレイ作成
-     */
-    private createOverlays(targets: JumpTarget[]): void {
-        this.overlayContainer = document.createElement('div');
-        this.overlayContainer.addClass('jump-plugin-overlay-container');
+    private createExtendedTarget(raw: RawTarget, offset: number, prefixes: string[], suffixLen: number): JumpTarget {
+        const prefixIndex = Math.floor(offset / suffixLen);
+        const suffixIndex = offset % suffixLen;
         
-        Object.assign(this.overlayContainer.style, {
+        // 安全策（通常ここには来ない）
+        if (prefixIndex >= prefixes.length) return this.createBaseTarget(raw, "?");
+
+        const p = prefixes[prefixIndex];
+        const s = this.fullAlphabet[suffixIndex];
+
+        return {
+            ...raw,
+            char: s,
+            label: `${p}${s}`,
+            prefix: p
+        };
+    }
+}
+
+/**
+ * DOM要素の生成とスタイル適用を担当
+ */
+class OverlayService {
+    private container: HTMLElement | null = null;
+
+    render(targets: JumpTarget[]): void {
+        this.remove();
+        this.container = this.createContainer();
+        
+        targets.forEach((target, i) => {
+            const nextTop = targets[i + 1]?.top;
+            const marker = this.createMarkerElement(target, nextTop);
+            target.element = marker;
+            this.container?.appendChild(marker);
+        });
+
+        document.body.appendChild(this.container);
+    }
+
+    updateVisibility(pendingPrefix: string | null): void {
+        if (!this.container) return;
+        const children = Array.from(this.container.children) as HTMLElement[];
+        
+        children.forEach(el => {
+            const text = el.textContent || "";
+            const isMatch = this.shouldShow(text, pendingPrefix);
+            this.applyVisibilityStyle(el, isMatch, !!pendingPrefix);
+        });
+    }
+
+    remove(): void {
+        if (this.container) {
+            this.container.remove();
+            this.container = null;
+        }
+    }
+
+    // --- Internal Helper Methods ---
+
+    private createContainer(): HTMLElement {
+        const el = document.createElement('div');
+        el.addClass('jump-plugin-overlay-container');
+        Object.assign(el.style, {
             position: 'fixed',
-            top: '0',
-            left: '0',
-            width: '100vw',
-            height: '100vh',
+            top: '0', left: '0',
+            width: '100vw', height: '100vh',
             pointerEvents: 'none',
             zIndex: '9999'
         });
+        return el;
+    }
 
-        // フォントサイズ設定
-        const MAX_FONT_SIZE = 26; // 最大サイズを大きく設定
-        const MIN_FONT_SIZE = 14;
+    private createMarkerElement(target: JumpTarget, nextTargetTop?: number): HTMLElement {
+        const fontSize = this.calculateFontSize(target.top, nextTargetTop);
+        const bgColor = this.getColorForChar(target.char);
+        
+        const el = document.createElement('div');
+        el.textContent = target.label;
+        
+        // スタイルオブジェクトを取得して適用
+        const styles = this.getMarkerStyles(target, fontSize, bgColor);
+        Object.assign(el.style, styles);
+        
+        return el;
+    }
 
-        for (let i = 0; i < targets.length; i++) {
-            const target = targets[i];
-            const nextTarget = targets[i + 1];
+    private calculateFontSize(currentTop: number, nextTop?: number): number {
+        if (!nextTop) return UI_CONSTANTS.MAX_FONT_SIZE;
 
-            // --- フォントサイズ計算（行間調整） ---
-            let fontSize = MAX_FONT_SIZE;
-            
-            if (nextTarget) {
-                const availableHeight = nextTarget.top - target.top;
-                // 枠線なし、padding極小のため、availableHeightのほぼ全てを使える
-                // 少しだけマージン(1px程度)を持たせる
-                const allowedFontSize = availableHeight - 1; 
-                
-                if (allowedFontSize < MAX_FONT_SIZE) {
-                    fontSize = Math.max(MIN_FONT_SIZE, allowedFontSize);
-                }
-            }
+        const availableHeight = nextTop - currentTop;
+        const allowedSize = availableHeight - 1; // マージン考慮
 
-            // --- 配色決定 ---
-            // サフィックス文字（target.char）に基づいて色を決定
-            const bgColor = this.getColorForChar(target.char);
-            
-            // 背景が明るいMonokaiカラーなので、文字色は背景色に近い濃い色にする
-            const textColor = '#272822'; 
-
-            const el = document.createElement('div');
-            el.textContent = target.label;
-            
-            Object.assign(el.style, {
-                position: 'absolute',
-                top: `${target.top}px`,
-                left: `${target.left}px`,
-                backgroundColor: bgColor,
-                color: textColor,
-                // border削除
-                border: 'none', 
-                fontSize: `${fontSize}px`,
-                fontFamily: 'monospace',
-                fontWeight: '900', // Bold
-                // padding縮小
-                padding: '0 2px', 
-                borderRadius: '2px',
-                // 境界線代わりの影（控えめに）
-                boxShadow: '0 1px 3px rgba(0,0,0,0.5)', 
-                lineHeight: '1',
-                // ベースライン調整: 文字が大きいので少し上にずらす
-                transform: 'translateY(-3px)', 
-                zIndex: '10000',
-                transition: 'opacity 0.1s, transform 0.1s',
-                whiteSpace: 'nowrap'
-            });
-
-            target.element = el;
-            this.overlayContainer?.appendChild(el);
+        if (allowedSize < UI_CONSTANTS.MAX_FONT_SIZE) {
+            return Math.max(UI_CONSTANTS.MIN_FONT_SIZE, allowedSize);
         }
+        return UI_CONSTANTS.MAX_FONT_SIZE;
+    }
 
-        document.body.appendChild(this.overlayContainer);
+    private getMarkerStyles(target: JumpTarget, fontSize: number, bgColor: string): Partial<CSSStyleDeclaration> {
+        return {
+            position: 'absolute',
+            top: `${target.top}px`,
+            left: `${target.left}px`,
+            backgroundColor: bgColor,
+            color: '#272822', // Dark Text
+            fontSize: `${fontSize}px`,
+            fontFamily: 'monospace',
+            fontWeight: '900',
+            padding: '0 2px',
+            borderRadius: '2px',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.5)',
+            lineHeight: '1',
+            transform: 'translateY(-3px)', // Baseline adjustment
+            zIndex: String(UI_CONSTANTS.Z_INDEX_BASE),
+            transition: 'opacity 0.1s, transform 0.1s',
+            whiteSpace: 'nowrap',
+            border: 'none'
+        };
+    }
+
+    private shouldShow(label: string, prefix: string | null): boolean {
+        if (prefix === null) return true;
+        return label.startsWith(prefix);
+    }
+
+    private applyVisibilityStyle(el: HTMLElement, isVisible: boolean, isFiltering: boolean): void {
+        if (isVisible) {
+            el.style.opacity = '1';
+            el.style.zIndex = isFiltering ? String(UI_CONSTANTS.Z_INDEX_ACTIVE) : String(UI_CONSTANTS.Z_INDEX_BASE);
+            el.style.transform = isFiltering ? 'translateY(-3px) scale(1.05)' : 'translateY(-3px)';
+        } else {
+            el.style.opacity = '0.05';
+            el.style.zIndex = '9999';
+            el.style.transform = 'translateY(-3px)';
+        }
+    }
+
+    private getColorForChar(char: string): string {
+        const c = char.toLowerCase();
+        if (/[a-e]/.test(c)) return MONOKAI.yellow;
+        if (/[f-j]/.test(c)) return MONOKAI.green;
+        if (/[k-o]/.test(c)) return MONOKAI.orange;
+        if (/[p-t]/.test(c)) return MONOKAI.purple;
+        if (/[u-z]/.test(c)) return MONOKAI.blue;
+        return MONOKAI.red;
+    }
+}
+
+/**
+ * 入力イベントの監視と制御フローを担当
+ */
+class InputHandler {
+    private keyListener: ((e: KeyboardEvent) => void) | null = null;
+    private pendingPrefix: string | null = null;
+
+    constructor(
+        private overlayService: OverlayService,
+        private onJump: (target: JumpTarget) => void,
+        private onCancel: () => void
+    ) {}
+
+    start(targets: JumpTarget[]): void {
+        this.pendingPrefix = null;
+        this.keyListener = (e) => this.handleKey(e, targets);
+        window.addEventListener('keydown', this.keyListener, { capture: true });
+    }
+
+    stop(): void {
+        if (this.keyListener) {
+            window.removeEventListener('keydown', this.keyListener, { capture: true });
+            this.keyListener = null;
+        }
+    }
+
+    private handleKey(e: KeyboardEvent, targets: JumpTarget[]): void {
+        if (this.shouldIgnoreKey(e)) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        const inputChar = e.key;
+
+        // 判定ロジックを順次実行
+        if (this.tryJump(targets, inputChar)) return;
+        if (this.trySetPrefix(targets, inputChar)) return;
+        
+        // どちらにも該当しなければキャンセル
+        this.onCancel();
+    }
+
+    private shouldIgnoreKey(e: KeyboardEvent): boolean {
+        return (
+            ["Shift", "Control", "Alt", "Meta"].includes(e.key) ||
+            e.isComposing || 
+            e.key === 'Process' || 
+            e.keyCode === 229
+        );
     }
 
     /**
-     * プレフィックス入力時の表示フィルタリング
+     * ジャンプ成立判定 (バグ修正: プレフィックスと同一キーの場合もここで確定させる)
      */
-    private updateOverlayVisibility(): void {
-        const children = this.overlayContainer?.children;
-        if (!children) return;
-
-        for (let i = 0; i < children.length; i++) {
-            const el = children[i] as HTMLElement;
-            const text = el.textContent || "";
-            
-            let shouldShow = false;
-
-            if (this.pendingPrefix === null) {
-                // 何も押されていない時は全て表示
-                shouldShow = true;
-            } else {
-                // プレフィックス入力済み
-                if (text.startsWith(this.pendingPrefix)) {
-                    shouldShow = true;
-                } else {
-                    shouldShow = false;
-                }
+    private tryJump(targets: JumpTarget[], input: string): boolean {
+        const target = targets.find(t => {
+            if (this.pendingPrefix !== null) {
+                return t.prefix === this.pendingPrefix && t.char === input;
             }
+            return t.prefix === null && t.char === input;
+        });
 
-            if (shouldShow) {
-                el.style.opacity = '1';
-                if (this.pendingPrefix) {
-                    // 選択中は少し強調
-                    el.style.transform = 'translateY(-3px) scale(1.05)';
-                    el.style.zIndex = '10001';
-                    // 選択中は白枠をつけて強調しても良いかもしれないが、
-                    // 要望通り枠線なしを基本とする
-                } else {
-                    el.style.transform = 'translateY(-3px)';
-                    el.style.zIndex = '10000';
-                }
-            } else {
-                el.style.opacity = '0.05'; // ほぼ透明に
-                el.style.transform = 'translateY(-3px)';
-                el.style.zIndex = '9999';
-            }
+        if (target) {
+            this.onJump(target);
+            return true;
         }
+        return false;
     }
 
-    private awaitInput(editor: Editor, targets: JumpTarget[]): void {
-        this.keyHandler = (e: KeyboardEvent) => {
-            if (["Shift", "Control", "Alt", "Meta"].includes(e.key)) return;
-            if (e.isComposing || e.key === 'Process' || e.keyCode === 229) return;
+    /**
+     * プレフィックス開始判定
+     */
+    private trySetPrefix(targets: JumpTarget[], input: string): boolean {
+        // すでにプレフィックス入力中の場合は変更不可
+        if (this.pendingPrefix !== null) return false;
 
-            e.preventDefault();
-            e.stopPropagation();
+        const isPrefixStart = targets.some(t => t.prefix === input);
+        if (isPrefixStart) {
+            this.pendingPrefix = input;
+            this.overlayService.updateVisibility(this.pendingPrefix);
+            return true;
+        }
+        return false;
+    }
+}
 
-            const inputChar = e.key;
+// --- Main Plugin Class ---
 
-            // --- プレフィックス判定 ---
-            const isPrefixChar = targets.some(t => t.prefix === inputChar);
+export default class JumpPlugin extends Plugin {
+    private coordinateService = CoordinateService;
+    private keyAssignmentService = new KeyAssignmentService();
+    private overlayService = new OverlayService();
+    private inputHandler: InputHandler | null = null;
 
-            if (isPrefixChar && this.pendingPrefix === null) {
-                this.pendingPrefix = inputChar;
-                this.updateOverlayVisibility();
-                return;
+    async onload() {
+        this.addCommand({
+            id: 'jump',
+            name: 'Jump',
+            editorCallback: (editor: Editor, view: MarkdownView) => {
+                this.initiateJump(editor, view);
             }
+        });
+    }
 
-            // --- キャンセル判定 ---
-            if (this.pendingPrefix !== null && inputChar === this.pendingPrefix) {
-                this.pendingPrefix = null;
-                this.updateOverlayVisibility();
-                return;
-            }
+    private initiateJump(editor: Editor, view: MarkdownView): void {
+        // 1. クリーンアップ (多重起動防止)
+        this.cleanup();
 
-            // --- ジャンプ判定 ---
-            const target = targets.find(t => {
-                if (this.pendingPrefix !== null) {
-                    return t.prefix === this.pendingPrefix && t.char === inputChar;
-                }
-                return t.prefix === null && t.char === inputChar;
-            });
+        // 2. ターゲット抽出
+        const rawTargets = this.coordinateService.getVisibleTargets(editor, view);
+        if (rawTargets.length === 0) return;
 
-            if (target) {
-                this.executeJump(editor, target);
-            } else {
-                this.cleanup();
-            }
-        };
+        // 3. キー割り当て
+        const targets = this.keyAssignmentService.assignKeys(rawTargets);
 
-        window.addEventListener('keydown', this.keyHandler, { capture: true });
+        // 4. UI描画
+        this.overlayService.render(targets);
+
+        // 5. 入力待ち開始
+        this.inputHandler = new InputHandler(
+            this.overlayService,
+            (target) => this.executeJump(editor, target), // Jump Callback
+            () => this.cleanup()                          // Cancel Callback
+        );
+        this.inputHandler.start(targets);
     }
 
     private executeJump(editor: Editor, target: JumpTarget): void {
@@ -385,15 +443,9 @@ export default class JumpPlugin extends Plugin {
     }
 
     private cleanup(): void {
-        if (this.overlayContainer) {
-            this.overlayContainer.remove();
-            this.overlayContainer = null;
-        }
-        if (this.keyHandler) {
-            window.removeEventListener('keydown', this.keyHandler, { capture: true });
-            this.keyHandler = null;
-        }
-        this.pendingPrefix = null;
+        this.inputHandler?.stop();
+        this.inputHandler = null;
+        this.overlayService.remove();
     }
 
     onunload() {
