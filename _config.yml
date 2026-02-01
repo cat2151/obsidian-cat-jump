@@ -1,0 +1,8 @@
+title: "obsidian-cat-jump"
+description: "Quickly jump to lines using a-z labels."
+theme: jekyll-theme-slate
+github:
+  is_project_page: true
+  repository_url: https://github.com/cat2151/obsidian-cat-jump
+plugins:
+  - jekyll-sitemap

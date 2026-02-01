@@ -1,5 +1,11 @@
 # obsidian-cat-jump
 
+<p align="left">
+  <a href="README.ja.md"><img src="https://img.shields.io/badge/🇯🇵-Japanese-red.svg" alt="Japanese"></a>
+  <a href="README.md"><img src="https://img.shields.io/badge/🇺🇸-English-blue.svg" alt="English"></a>
+  <a href="https://deepwiki.com/cat2151/obsidian-cat-jump"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+</p>
+
 An Obsidian community plugin that allows you to quickly jump your cursor to any location within a note.
 
 ## Installation
